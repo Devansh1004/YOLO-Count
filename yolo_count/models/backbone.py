@@ -17,6 +17,12 @@ from yolo_count.models.module import (
 )
 
 
+def normalize_texts(text):
+    if isinstance(text[0], str):
+        return [[t] for t in text]
+    return text
+
+
 class HuggingCLIPLanguageBackbone(nn.Module):
     def __init__(
         self,
@@ -42,8 +48,15 @@ class HuggingCLIPLanguageBackbone(nn.Module):
             text = self.tokenizer(text=text, return_tensors="pt", padding=True)
             self.text = text.to(device=self.model.device)
         return self.text
+        
+    def forward_tokenizer_new(self, texts):
+        text = list(itertools.chain(*texts))
+        text = self.tokenizer(text=text, return_tensors="pt", padding=True)
+        return text.to(device=self.model.device)
 
-    def forward(self, text: List[List[str]]) -> torch.Tensor:
+    def forward(self, text) -> torch.Tensor:
+        # instead of assuming text as [[str]], we enforce that condition
+        text = normalize_texts(text)
         num_per_batch = [len(t) for t in text]
         assert max(num_per_batch) == min(
             num_per_batch
@@ -53,8 +66,14 @@ class HuggingCLIPLanguageBackbone(nn.Module):
         text = text.to(device=self.model.device)
         txt_outputs = self.model(**text)
         txt_feats = txt_outputs.text_embeds
+        
+        B = len(num_per_batch)
+        K = num_per_batch[0]
+        txt_feats = txt_feats.view(B, K, -1)
+        
         txt_feats = txt_feats / txt_feats.norm(p=2, dim=-1, keepdim=True)
-        txt_feats = txt_feats.reshape(-1, num_per_batch[0], txt_feats.shape[-1])
+        # txt_feats = txt_feats.reshape(-1, num_per_batch[0], txt_feats.shape[-1])
+    
         return txt_feats
 
     def _freeze_modules(self):

@@ -542,15 +542,35 @@ class MaxSigmoidAttnBlock(nn.Module):
             attn_weight = torch.matmul(embed, guide)
             attn_weight = attn_weight.reshape(batch, m, height, width, n)
 
-        attn_weight = attn_weight.max(dim=-1)[0]
+        # attn_weight = attn_weight.max(dim=-1)[0]
         attn_weight = attn_weight / (self.head_channels**0.5)
         attn_weight = attn_weight + self.bias[None, :, None, None]
         attn_weight = attn_weight.sigmoid() * self.scale
 
-        x = self.project_conv(x)
-        x = x.reshape(B, self.num_heads, -1, H, W)
-        x = x * attn_weight.unsqueeze(2)
-        x = x.reshape(B, -1, H, W)
+        # x = self.project_conv(x)
+        # x = x.reshape(B, self.num_heads, -1, H, W)
+        # x = x * attn_weight.unsqueeze(2)
+        # x = x.reshape(B, -1, H, W)
+        
+        x = self.project_conv(x)  # [B, C, H, W]
+
+        # reshape
+        x = x.reshape(B, self.num_heads, -1, H, W)  # [B, M, C', H, W]
+
+        # expand across K
+        K = attn_weight.shape[-1]
+        x = x.unsqueeze(-1)  # [B, M, C', H, W, 1]
+
+        attn_weight = attn_weight.unsqueeze(2)  # [B, M, 1, H, W, K]
+
+        x = x * attn_weight  # [B, M, C', H, W, K]
+
+        # merge heads
+        x = x.reshape(B, -1, H, W, K)
+
+        # move K to channel dim
+        x = x.permute(0, 4, 1, 2, 3)  # [B, K, C, H, W]
+        x = x.reshape(B, -1, H, W)    # [B, K*C, H, W]
         return x
 
 
@@ -633,3 +653,39 @@ class MaxSigmoidCSPLayerWithTwoConv(nn.Module):
         x_main.extend(blocks(x_main[-1]) for blocks in self.blocks)
         x_main.append(self.attn_block(x_main[-1], guide))
         return self.final_conv(torch.cat(x_main, 1))
+    
+    def forward_new(self, x: torch.Tensor, guide: torch.Tensor) -> torch.Tensor:
+        B = x.shape[0]
+        K = guide.shape[1]
+
+        x_main = self.main_conv(x)
+        x_main = list(x_main.split((self.mid_channels, self.mid_channels), 1))
+
+        # expand base features to K
+        x_main = [xi.unsqueeze(1).repeat(1, K, 1, 1, 1) for xi in x_main]  # [B,K,C,H,W]
+
+        # process blocks
+        for blocks in self.blocks:
+            x_main.append(blocks(x_main[-1].reshape(B*K, -1, x.shape[2], x.shape[3]))
+                        .reshape(B, K, -1, x.shape[2], x.shape[3]))
+
+        # attention block (already K-aware)
+        attn_out = self.attn_block(
+            x_main[-1].reshape(B*K, -1, x.shape[2], x.shape[3]),
+            guide
+        )  # returns [B, K*C, H, W]
+
+        attn_out = attn_out.reshape(B, K, -1, x.shape[2], x.shape[3])
+
+        x_main.append(attn_out)
+
+        # concat along channel
+        x_main = [xi.reshape(B*K, -1, x.shape[2], x.shape[3]) for xi in x_main]
+
+        out = self.final_conv(torch.cat(x_main, 1))  # [B*K, C, H, W]
+
+        # restore K dimension
+        out = out.reshape(B, K, -1, x.shape[2], x.shape[3])
+        out = out.reshape(B, -1, x.shape[2], x.shape[3])  # flatten K into channels
+
+        return out

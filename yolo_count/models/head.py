@@ -75,6 +75,7 @@ class ProportionCountingHead(nn.Module):
         self.freeze_all = freeze_all
         self.norm_cfg = norm_cfg
         self.act_cfg = act_cfg
+        self.num_classes = None
 
         # Feature extraction for classification branch
         self.conv_80_cls = ConvModule(
@@ -184,8 +185,8 @@ class ProportionCountingHead(nn.Module):
             ]
         )
 
-        # Density map prediction head
-        self.density_head = nn.Sequential(
+        # Density map feature extractor (shared across classes)
+        self.density_head_new = nn.Sequential(
             ConvModule(
                 self.embed_dims * 3 // 2,
                 self.embed_dims // 2,
@@ -210,20 +211,21 @@ class ProportionCountingHead(nn.Module):
                 norm_cfg=norm_cfg,
                 act_cfg=act_cfg,
             ),
-            nn.Conv2d(self.embed_dims // 8, 1, 1),
         )
+
+        # Projects density features into the CLIP embedding space (512-d)
+        # so that per-class density maps are produced via dot product with
+        # the text embeddings — exactly like cls_contrast but for density.
+        self.density_proj = nn.Conv2d(self.embed_dims // 8, 512, 1)
 
         self._init_weights()
 
     def _init_weights(self):
         """Initialize network weights"""
-        # ConvModule already applies Kaiming initialization
-        # Only need to specially handle the last layer of the density head
-        nn.init.constant_(self.density_head[-1].weight, 0)
-        nn.init.constant_(self.density_head[-1].bias, 0.01)
+        nn.init.normal_(self.density_proj.weight, std=0.01)
+        nn.init.constant_(self.density_proj.bias, 0)
 
     def train(self, mode: bool = True):
-
         super().train(mode)
         if self.freeze_all:
             for m in self.modules():
@@ -238,8 +240,27 @@ class ProportionCountingHead(nn.Module):
         img_feats_2: Tuple[torch.Tensor],
         txt_feats: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Multiclass forward pass.
 
-        feat_80 = self.conv_80_cls(img_feats_1[0])
+        Args:
+            img_feats_1: tuple of image features for the classification branch,
+                         each with shape [B, C, H, W].
+            img_feats_2: tuple of image features for the density branch,
+                         each with shape [B, C, H, W].
+            txt_feats:   text features with shape [B, K, 512], where K is the
+                         number of query classes.
+
+        Returns:
+            cls_logit:    classification logits  [B, K, H, W]
+            density_pred: per-class density maps [B, K, H, W]  (non-negative)
+        """
+        B, K, _ = txt_feats.shape
+
+        # ── Classification branch ────────────────────────────────────────────
+        # Image features are class-agnostic here; we compute a single shared
+        # semantic map and then compare it against all K text embeddings via
+        # the ContrastiveHead (which already handles the [B,K] dimension).
+        feat_80 = self.conv_80_cls(img_feats_1[0])   # [B, D, H, W]
         feat_40 = self.conv_40_cls(img_feats_1[1])
         feat_20 = self.conv_20_cls(img_feats_1[2])
 
@@ -251,10 +272,13 @@ class ProportionCountingHead(nn.Module):
         )
 
         semantic_feat = torch.cat([feat_80, feat_40_up, feat_20_up], dim=1)
-        semantic_feat = self.semantic_branch(semantic_feat)
-        cls_logit = self.cls_contrast(semantic_feat, txt_feats)
+        semantic_feat = self.semantic_branch(semantic_feat)          # [B, D, H, W]
 
-        density_feat_80 = self.density_branch[0](img_feats_2[0])
+        # cls_contrast handles [B, K, 512] text and [B, D, H, W] image → [B, K, H, W]
+        cls_logit = self.cls_contrast(semantic_feat, txt_feats)      # [B, K, H, W]
+
+        # ── Density branch ───────────────────────────────────────────────────
+        density_feat_80 = self.density_branch[0](img_feats_2[0])     # [B, D/2, H, W]
         density_feat_40 = F.interpolate(
             self.density_branch[1](img_feats_2[1]),
             size=density_feat_80.shape[2:],
@@ -270,8 +294,20 @@ class ProportionCountingHead(nn.Module):
 
         density_feat = torch.cat(
             [density_feat_80, density_feat_40, density_feat_20], dim=1
-        )
+        )                                                             # [B, 3D/2, H, W]
 
-        density_pred = F.relu(self.density_head(density_feat))
+        # Shared density feature map (class-agnostic spatial cues)
+        density_feat = self.density_head_new(density_feat)           # [B, D/8, H, W]
+
+        # Project into CLIP space so we can dot-product with each text vector
+        density_feat = self.density_proj(density_feat)               # [B, 512, H, W]
+
+        # L2-normalise both sides before dot product (same as ContrastiveHead)
+        density_feat = F.normalize(density_feat, dim=1, p=2)
+        txt_feats_norm = F.normalize(txt_feats, dim=-1, p=2)
+
+        # Per-class density map: [B, K, H, W]
+        density_pred = torch.einsum("bchw,bkc->bkhw", density_feat, txt_feats_norm)
+        density_pred = F.relu(density_pred)
 
         return cls_logit, density_pred

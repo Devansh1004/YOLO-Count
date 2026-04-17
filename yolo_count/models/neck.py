@@ -130,6 +130,15 @@ class YOLOCountPAFPN(nn.Module):
         self, img_feats: List[torch.Tensor], txt_feats: torch.Tensor = None
     ) -> tuple:
         """Forward function."""
+        
+        if txt_feats is not None:
+            assert txt_feats.dim() == 3, \
+                f"Expected txt_feats shape [B, K, D], got {txt_feats.shape}"
+                
+        if txt_feats is not None:
+            assert txt_feats.shape[0] == img_feats[0].shape[0], \
+                "Batch size mismatch between image and text"
+        
         assert len(img_feats) == len(
             self.in_channels
         ), f"The length of img_feats must be equal to the length of in_channels, but got {len(img_feats)} and {len(self.in_channels)}"
